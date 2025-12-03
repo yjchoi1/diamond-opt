@@ -173,11 +173,33 @@ def get_truncated_octahedron_data():
         dist = np.linalg.norm(irregular_vertices[u] - irregular_vertices[v])
         measured_edge_lengths.append(float(dist))
 
+    # 7. Calculate Measured Diagonal Lengths (Rigidify Faces)
+    diagonals = []
+    measured_diagonal_lengths = []
+    # Create a set for quick edge lookup to ensure we don't add edges as diagonals
+    edges_set_lookup = set(tuple(sorted((u, v))) for u, v in edges)
+
+    for face in faces:
+        n = len(face)
+        # Compare every pair of vertices in the face
+        for i in range(n):
+            for j in range(i + 1, n):
+                u, v = face[i], face[j]
+                if u > v: u, v = v, u
+                
+                # If it's not an edge, it's a diagonal
+                if (u, v) not in edges_set_lookup:
+                    dist = np.linalg.norm(irregular_vertices[u] - irregular_vertices[v])
+                    diagonals.append([int(u), int(v)])
+                    measured_diagonal_lengths.append(float(dist))
+
     return {
         "vertices": irregular_vertices.tolist(),
         "edges": [[int(u), int(v)] for u, v in edges], # list of [u, v]
         "faces": [[int(x) for x in f] for f in faces], # list of lists
         "measured_edge_lengths": measured_edge_lengths,
+        "diagonals": diagonals,
+        "measured_diagonal_lengths": measured_diagonal_lengths,
         "anchor_face": [int(x) for x in anchor_face] if anchor_face else None
     }
 

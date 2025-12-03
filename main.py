@@ -14,7 +14,7 @@ from visualizer import plot_optimization_history, plot_3d_comparison, plot_3d_an
 INPUT_CONFIG = {
     "data_path": "diamond_data.json",
     "use_scale_initialization": False,
-    "initial_perturbation": 0.2,  # If use_scale_initialization is False. We just perturb the vertices, but fix the anchor vertices.
+    "initial_perturbation": 0.5,  # If use_scale_initialization is False. We just perturb the vertices, but fix the anchor vertices.
     "scale_factor": 1.1, # If use_scale_initialization is True. We scale the vertices, but fix the anchor vertices.
     "optimization": {
         "method": "L-BFGS-B",
@@ -24,7 +24,8 @@ INPUT_CONFIG = {
     "weights": {
         "length": 1.0,  # 1
         "planarity": 100.0,  # 1000
-        "convexity": 100.0  # 100
+        "convexity": 100.0,  # 100
+        "diagonal": 1.0 # Weight for diagonal constraints
     }
 }
 # ------------------------
@@ -39,6 +40,13 @@ class DiamondReconstruction:
         self.edges = self.data['edges']
         self.faces = self.data['faces']
         self.measured_lengths = torch.tensor(self.data['measured_edge_lengths'], dtype=torch.float64)
+        
+        # Load Diagonal Data
+        # Diagonals are critical for rigidifying non-triangular faces (e.g. squares, hexagons).
+        # Without them, the shape can shear while preserving edge lengths.
+        self.diagonals = self.data.get('diagonals', [])
+        self.measured_diagonal_lengths = torch.tensor(self.data.get('measured_diagonal_lengths', []), dtype=torch.float64)
+        
         self.anchor_indices = self.data['anchor_face']
         
         # Identify variable indices (non-anchor)
@@ -143,7 +151,22 @@ class DiamondReconstruction:
         length_residuals = current_lengths - self.measured_lengths
         length_loss = torch.sum(length_residuals**2)
         
-        # 2. Planarity Constraints (Penalty)
+        # 2. Diagonal Length Constraints
+        # Minimize the difference between current diagonal lengths and measured diagonal lengths.
+        # This prevents shearing of non-triangular faces.
+        diag_loss = 0.0
+        if len(self.diagonals) > 0:
+            u_diag = [d[0] for d in self.diagonals]
+            v_diag = [d[1] for d in self.diagonals]
+            
+            p_u_d = vertices[u_diag]
+            p_v_d = vertices[v_diag]
+            
+            current_diag_lengths = torch.norm(p_u_d - p_v_d, dim=1)
+            diag_residuals = current_diag_lengths - self.measured_diagonal_lengths
+            diag_loss = torch.sum(diag_residuals**2)
+        
+        # 3. Planarity Constraints (Penalty)
         # For each face, minimize the smallest eigenvalue of the covariance matrix
         planarity_loss = 0.0
         convexity_loss = 0.0
@@ -200,7 +223,8 @@ class DiamondReconstruction:
         total_loss = (
             self.config["weights"]["length"] * length_loss + 
             self.config["weights"]["planarity"] * planarity_loss + 
-            self.config["weights"]["convexity"] * convexity_loss
+            self.config["weights"]["convexity"] * convexity_loss +
+            self.config["weights"]["diagonal"] * diag_loss
         )
         
         return total_loss
