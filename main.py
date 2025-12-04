@@ -12,7 +12,7 @@ from visualizer import plot_optimization_history, plot_3d_comparison, plot_3d_an
 
 # --- Hardcoded Inputs ---
 INPUT_CONFIG = {
-    "data_path": "diamond_data.json",
+    "data_path": "diamond_data_experiment.json", # Updated to use blind data by default
     "use_scale_initialization": False,
     "initial_perturbation": 0.5,  # If use_scale_initialization is False. We just perturb the vertices, but fix the anchor vertices.
     "scale_factor": 1.1, # If use_scale_initialization is True. We scale the vertices, but fix the anchor vertices.
@@ -36,7 +36,16 @@ class DiamondReconstruction:
         with open(config["data_path"], 'r') as f:
             self.data = json.load(f)
         
-        self.true_vertices = np.array(self.data['vertices'])
+        # Check if true vertices exist
+        if 'vertices' in self.data:
+            self.true_vertices = np.array(self.data['vertices'])
+            self.n_vertices = len(self.true_vertices)
+        else:
+            self.true_vertices = None
+            # Infer N from edges if vertices not provided
+            all_edge_indices = [idx for edge in self.data['edges'] for idx in edge]
+            self.n_vertices = max(all_edge_indices) + 1
+
         self.edges = self.data['edges']
         self.faces = self.data['faces']
         self.measured_lengths = torch.tensor(self.data['measured_edge_lengths'], dtype=torch.float64)
@@ -49,52 +58,77 @@ class DiamondReconstruction:
         
         self.anchor_indices = self.data['anchor_face']
         
+        # Handle Anchor Coordinates
+        if self.true_vertices is not None:
+            anchor_coords_np = self.true_vertices[self.anchor_indices]
+        else:
+            if 'anchor_coordinates' in self.data:
+                anchor_coords_np = np.array(self.data['anchor_coordinates'])
+            else:
+                raise ValueError("If 'vertices' are not provided, 'anchor_coordinates' must be present.")
+
+        self.fixed_coords = torch.tensor(anchor_coords_np, dtype=torch.float64)
+
         # Identify variable indices (non-anchor)
-        self.n_vertices = len(self.true_vertices)
         all_indices = set(range(self.n_vertices))
         self.fixed_indices_set = set(self.anchor_indices)
         self.variable_indices = sorted(list(all_indices - self.fixed_indices_set))
         
-        # Initial Guess: Perturb the true vertices (except anchor)
-        # to create a non-trivial starting point.
-        # This simulates starting from a generic shape.
+        # Initial Guess
         np.random.seed(42)
         
-        if config.get("use_scale_initialization", False):
-             # Option 2: Scale the shape (preserving convexity)
-             # We scale around the centroid of the anchor face (or global centroid)
-             # Let's scale relative to the anchor face center to keep anchor fixed-ish
-             # Actually, anchor face is fixed.
-             # We should scale the Z-height or overall size relative to anchor.
-             print(f"Initializing with Scale Factor: {config['scale_factor']}")
-             initial_vertices = self.true_vertices.copy()
-             
-             anchor_center = np.mean(initial_vertices[self.anchor_indices], axis=0)
-             
-             # Vector from anchor center
-             vecs = initial_vertices - anchor_center
-             
-             # Scale
-             scaled_vecs = vecs * config["scale_factor"]
-             
-             initial_vertices = anchor_center + scaled_vecs
-             
-             # Reset anchor vertices to exact true position (since they are fixed)
-             # Although scaling relative to anchor center should preserve them if they are on a plane?
-             # If scaling is uniform, they expand.
-             # So we must force anchor vertices back to true positions (which the optimizer treats as fixed anyway)
-             initial_vertices[self.anchor_indices] = self.true_vertices[self.anchor_indices]
-             
+        if self.true_vertices is not None:
+            # Original Logic: Perturb true vertices
+            if config.get("use_scale_initialization", False):
+                 # Option 2: Scale the shape (preserving convexity)
+                 # We scale around the centroid of the anchor face (or global centroid)
+                 # Let's scale relative to the anchor face center to keep anchor fixed-ish
+                 # Actually, anchor face is fixed.
+                 # We should scale the Z-height or overall size relative to anchor.
+                 print(f"Initializing with Scale Factor: {config['scale_factor']}")
+                 initial_vertices = self.true_vertices.copy()
+                 
+                 anchor_center = np.mean(initial_vertices[self.anchor_indices], axis=0)
+                 
+                 # Vector from anchor center
+                 vecs = initial_vertices - anchor_center
+                 
+                 # Scale
+                 scaled_vecs = vecs * config["scale_factor"]
+                 
+                 initial_vertices = anchor_center + scaled_vecs
+                 
+                 # Reset anchor vertices to exact true position (since they are fixed)
+                 # Although scaling relative to anchor center should preserve them if they are on a plane?
+                 # If scaling is uniform, they expand.
+                 # So we must force anchor vertices back to true positions (which the optimizer treats as fixed anyway)
+                 initial_vertices[self.anchor_indices] = self.true_vertices[self.anchor_indices]
+                 
+            else:
+                # Option 1: Random Perturbation
+                print("Initializing with Random Perturbation of True Vertices")
+                perturbation = np.random.normal(0, config["initial_perturbation"], self.true_vertices.shape)
+                initial_vertices = self.true_vertices.copy()
+                # Only perturb variable vertices
+                initial_vertices[self.variable_indices] += perturbation[self.variable_indices]
         else:
-            # Option 1: Random Perturbation
-            print("Initializing with Random Perturbation")
-            perturbation = np.random.normal(0, config["initial_perturbation"], self.true_vertices.shape)
-            initial_vertices = self.true_vertices.copy()
-            # Only perturb variable vertices
-            initial_vertices[self.variable_indices] += perturbation[self.variable_indices]
-        
-        # Prepare fixed coordinates
-        self.fixed_coords = torch.tensor(self.true_vertices[self.anchor_indices], dtype=torch.float64)
+            # Blind Initialization Logic
+            print("Initializing with Blind Guess")
+            initial_vertices = np.zeros((self.n_vertices, 3))
+            
+            # Set anchor vertices
+            initial_vertices[self.anchor_indices] = anchor_coords_np
+            
+            # Initialize variable vertices randomly around the anchor center
+            anchor_center = np.mean(anchor_coords_np, axis=0)
+            
+            # We assume a scale similar to the anchor spread or edge lengths (approx 1.0 - 2.0)
+            # Let's use a normal distribution centered at anchor center
+            scale = 2.0 
+            random_offset = np.random.normal(0, scale, (self.n_vertices, 3)) # generate for all
+            
+            # Assign to variable indices
+            initial_vertices[self.variable_indices] = anchor_center + random_offset[self.variable_indices]
         
         # Decision Variables (Variables x 3)
         self.x_vars = torch.tensor(
@@ -191,15 +225,8 @@ class DiamondReconstruction:
             # Smallest eigenvalue should be 0 for planar
             min_eig = eigs[0] 
             planarity_loss += min_eig**2 
-
-            # Convexity / Star-convexity check
-            # Normal Estimation (Planar fit normal or simple cross product)
-            # Since we enforce planarity, cross product of first two edges is sufficient approx
-            # But to be robust, use the eigenvector corresponding to min_eig (which is the normal)
-            # However, eigenvectors don't have consistent sign direction.
-            # So we use cross product of edges: (v1-v0) x (v2-v0)
-            # We assume face vertices are ordered consistently (CCW or CW)
             
+            # Convexity / Star-convexity check
             v0 = face_verts[0]
             v1 = face_verts[1]
             v2 = face_verts[2]
@@ -211,13 +238,10 @@ class DiamondReconstruction:
             dir_vec = center - centroid
             
             # Dot product should be positive (outward facing)
-            # We need to verify if the original data has outward facing normals.
-            # Assuming standard ConvexHull output, they are outward.
             dot_prod = torch.dot(normal, dir_vec)
             
             # If dot_prod < 0, it means the face is facing "inward" relative to centroid
             # Penalize this.
-            # We use ReLU to only penalize negative values
             convexity_loss += torch.relu(-dot_prod + 0.1) ** 2 # Margin of 0.1
             
         total_loss = (
@@ -245,14 +269,16 @@ class DiamondReconstruction:
             
             self.loss_history.append(val)
             
-            # Calculate Model Error (MSE of vertices)
-            # We need full vertices
+            # Calculate Model Error (MSE of vertices) if true vertices exist
             with torch.no_grad():
-                x_reshaped = t_x.reshape(-1, 3)
-                current_verts = self.get_full_vertices(x_reshaped).cpu().numpy()
-                # Mean Squared Error between estimated and true vertices
-                mse = np.mean((current_verts - self.true_vertices)**2)
-                self.model_error_history.append(mse)
+                if self.true_vertices is not None:
+                    x_reshaped = t_x.reshape(-1, 3)
+                    current_verts = self.get_full_vertices(x_reshaped).cpu().numpy()
+                    # Mean Squared Error between estimated and true vertices
+                    mse = np.mean((current_verts - self.true_vertices)**2)
+                    self.model_error_history.append(mse)
+                else:
+                     self.model_error_history.append(0.0) # Placeholder
             
             return val, grad
 
@@ -318,8 +344,8 @@ class DiamondReconstruction:
 
 if __name__ == "__main__":
     # Generate data if not exists (though we already did)
-    if not os.path.exists("diamond_data.json"):
-        print("Error: diamond_data.json not found.")
+    if not os.path.exists(INPUT_CONFIG["data_path"]):
+        print(f"Error: {INPUT_CONFIG['data_path']} not found.")
         sys.exit(1)
         
     reconstruction = DiamondReconstruction(INPUT_CONFIG)
@@ -328,8 +354,14 @@ if __name__ == "__main__":
     reconstruction.verify_results(final_verts)
     
     # Visualization
-    plot_optimization_history(history, model_errors=model_errors)
-    # plot_3d_comparison is redundant if we have animation, but kept for single view
+    # Pass None for model_errors if we don't have true vertices (or handle inside visualizer)
+    # The visualizer handles model_errors=None, but we passed a list of zeros if true_vertices is None.
+    # Better to pass None explicitly if true_vertices is None to avoid plotting a flat zero line which is misleading.
+    
+    plot_model_errors = model_errors if reconstruction.true_vertices is not None else None
+    
+    plot_optimization_history(history, model_errors=plot_model_errors)
+    
     plot_3d_comparison(
         final_verts, 
         reconstruction.true_vertices, 
@@ -343,4 +375,3 @@ if __name__ == "__main__":
         reconstruction.faces,
         filename="diamond_reconstruction_animation.html"
     )
-
