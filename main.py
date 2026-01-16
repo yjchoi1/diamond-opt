@@ -5,6 +5,8 @@ import time
 from scipy.optimize import minimize
 import sys
 import os
+from generate_guess import get_initial_guess
+import trimesh
 
 # Add current directory to path to import visualizer
 sys.path.append(os.getcwd())
@@ -13,9 +15,13 @@ from visualizer import plot_optimization_history, plot_3d_comparison, plot_3d_an
 # --- Hardcoded Inputs ---
 INPUT_CONFIG = {
     "data_path": "diamond_data_experiment.json", # Updated to use blind data by default
-    "use_scale_initialization": False,
-    "initial_perturbation": 0.5,  # If use_scale_initialization is False. We just perturb the vertices, but fix the anchor vertices.
-    "scale_factor": 1.1, # If use_scale_initialization is True. We scale the vertices, but fix the anchor vertices.
+    # "data_path": "diamond_data_blind2.json",
+    # "data_path": "diamond_data.json",
+    # "initial_guess": "perturb",  # Options: auto, scale, perturb, mds, blind, polyhedron
+    "initial_guess": "polyhedron",  # Options: auto, scale, perturb, mds, blind, polyhedron
+    "polyhedron_size": 1, # Used when initial_guess is set to polyhedron
+    "initial_perturbation": 0.5,  # Used when initial_guess is set to perturb
+    "scale_factor": 1.1, # Used when initial_guess is set to scale
     "optimization": {
         "method": "L-BFGS-B",
         "maxiter": 2000,
@@ -23,9 +29,9 @@ INPUT_CONFIG = {
     },
     "weights": {
         "length": 1.0,  # 1
-        "planarity": 100.0,  # 1000
-        "convexity": 100.0,  # 100
-        "diagonal": 1.0 # Weight for diagonal constraints
+        "planarity": 0.01,  # 1000
+        "convexity": 0.0,  # 100
+        "diagonal": 0.0 # 1.0 Weight for diagonal constraints
     }
 }
 # ------------------------
@@ -76,59 +82,7 @@ class DiamondReconstruction:
         
         # Initial Guess
         np.random.seed(42)
-        
-        if self.true_vertices is not None:
-            # Original Logic: Perturb true vertices
-            if config.get("use_scale_initialization", False):
-                 # Option 2: Scale the shape (preserving convexity)
-                 # We scale around the centroid of the anchor face (or global centroid)
-                 # Let's scale relative to the anchor face center to keep anchor fixed-ish
-                 # Actually, anchor face is fixed.
-                 # We should scale the Z-height or overall size relative to anchor.
-                 print(f"Initializing with Scale Factor: {config['scale_factor']}")
-                 initial_vertices = self.true_vertices.copy()
-                 
-                 anchor_center = np.mean(initial_vertices[self.anchor_indices], axis=0)
-                 
-                 # Vector from anchor center
-                 vecs = initial_vertices - anchor_center
-                 
-                 # Scale
-                 scaled_vecs = vecs * config["scale_factor"]
-                 
-                 initial_vertices = anchor_center + scaled_vecs
-                 
-                 # Reset anchor vertices to exact true position (since they are fixed)
-                 # Although scaling relative to anchor center should preserve them if they are on a plane?
-                 # If scaling is uniform, they expand.
-                 # So we must force anchor vertices back to true positions (which the optimizer treats as fixed anyway)
-                 initial_vertices[self.anchor_indices] = self.true_vertices[self.anchor_indices]
-                 
-            else:
-                # Option 1: Random Perturbation
-                print("Initializing with Random Perturbation of True Vertices")
-                perturbation = np.random.normal(0, config["initial_perturbation"], self.true_vertices.shape)
-                initial_vertices = self.true_vertices.copy()
-                # Only perturb variable vertices
-                initial_vertices[self.variable_indices] += perturbation[self.variable_indices]
-        else:
-            # Blind Initialization Logic
-            print("Initializing with Blind Guess")
-            initial_vertices = np.zeros((self.n_vertices, 3))
-            
-            # Set anchor vertices
-            initial_vertices[self.anchor_indices] = anchor_coords_np
-            
-            # Initialize variable vertices randomly around the anchor center
-            anchor_center = np.mean(anchor_coords_np, axis=0)
-            
-            # We assume a scale similar to the anchor spread or edge lengths (approx 1.0 - 2.0)
-            # Let's use a normal distribution centered at anchor center
-            scale = 2.0 
-            random_offset = np.random.normal(0, scale, (self.n_vertices, 3)) # generate for all
-            
-            # Assign to variable indices
-            initial_vertices[self.variable_indices] = anchor_center + random_offset[self.variable_indices]
+        initial_vertices = get_initial_guess(self.data, self.config, self.true_vertices)
         
         # Decision Variables (Variables x 3)
         self.x_vars = torch.tensor(
@@ -341,6 +295,174 @@ class DiamondReconstruction:
         
         print(f"Max Edge Length Error: {max_length_error:.2e}")
 
+    def calculate_volume(self, vertices):
+        """Calculates the volume of the polyhedron using the divergence theorem.
+
+        Assumes faces are consistently oriented (e.g., all outward or all inward).
+        Uses the formula: V = 1/6 * sum(dot(v0, cross(v1, v2))) for triangulated faces.
+
+        Args:
+            vertices: A numpy array of shape (N, 3) containing vertex coordinates.
+
+        Returns:
+            float: The calculated volume of the polyhedron.
+        """
+        # Analytic/divergence-theorem-style volume using fan triangulation
+        volume = 0.0
+        triangulated_faces = []  # store triangles as index triplets for trimesh
+        for face in self.faces:
+            # Triangulate face: (v0, vi, vi+1)
+            # Assuming convex/star-shaped faces with respect to v0
+            v0_idx = face[0]
+            v0 = vertices[v0_idx]
+            for i in range(1, len(face) - 1):
+                v1_idx = face[i]
+                v2_idx = face[i+1]
+                v1 = vertices[v1_idx]
+                v2 = vertices[v2_idx]
+
+                # Signed volume of tetrahedron with origin
+                # V = 1/6 * det(v0, v1, v2) = 1/6 * dot(v0, cross(v1, v2))
+                cross_prod = np.cross(v1, v2)
+                tet_vol = np.dot(v0, cross_prod) / 6.0
+                volume += tet_vol
+
+                triangulated_faces.append([v0_idx, v1_idx, v2_idx])
+
+        volume = abs(volume)
+
+        tri_faces_arr = np.array(triangulated_faces, dtype=int)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=tri_faces_arr, process=True)
+        trimesh_volume = float(mesh.volume)
+
+        # Diagnostics about mesh quality and orientation
+        print(
+            f"trimesh: watertight={mesh.is_watertight}, "
+            f"winding_consistent={mesh.is_winding_consistent}"
+        )
+
+        # Try fixing normals / winding and recomputing volume
+        mesh_fixed = mesh.copy()
+        mesh_fixed.fix_normals()
+        trimesh_volume_fixed = float(mesh_fixed.volume)
+
+        print(
+            f"Volume (analytic): {volume:.6f}, "
+            f"Volume (trimesh): {trimesh_volume:.6f}, "
+            f"Volume (trimesh, fixed_normals): {trimesh_volume_fixed:.6f}"
+        )
+        
+        return volume
+
+    def calculate_opposing_distances(self, vertices):
+        """Calculates distances between centroids of opposing faces."""
+        distances = []
+        face_centroids = []
+        face_normals = []
+
+        for face in self.faces:
+            face_verts = vertices[face]
+            centroid = np.mean(face_verts, axis=0)
+            face_centroids.append(centroid)
+            
+            # Normal using first 3 vertices (assuming consistent winding/convexity)
+            v0, v1, v2 = face_verts[0], face_verts[1], face_verts[2]
+            normal = np.cross(v1 - v0, v2 - v0)
+            norm_val = np.linalg.norm(normal)
+            normal = normal / norm_val if norm_val > 1e-8 else np.array([0.0, 0.0, 1.0])
+            face_normals.append(normal)
+
+        processed_pairs = set()
+        for i in range(len(self.faces)):
+            n_i = face_normals[i]
+            c_i = face_centroids[i]
+            
+            # Find best opposing face
+            best_match_idx = -1
+            min_dot = 1.0
+            
+            for j in range(len(self.faces)):
+                if i == j: continue
+                dot_prod = np.dot(n_i, face_normals[j])
+                if dot_prod < min_dot:
+                    min_dot = dot_prod
+                    best_match_idx = j
+            
+            # If sufficiently opposing (anti-parallel)
+            if min_dot < -0.9 and best_match_idx != -1:
+                j = best_match_idx
+                pair = tuple(sorted((i, j)))
+                if pair not in processed_pairs:
+                    processed_pairs.add(pair)
+                    c_j = face_centroids[j]
+                    dist = float(np.linalg.norm(c_i - c_j))
+                    distances.append({
+                        "face_indices": [int(pair[0]), int(pair[1])],
+                        "distance": dist,
+                        "normal_alignment": float(min_dot)
+                    })
+                    print(f"Opposing faces {pair}: Distance={dist:.2f}, Alignment={min_dot:.4f}")
+                    
+        return distances
+
+    def save_reconstructed_data(self, vertices, output_path):
+        """Save the reconstructed shape data in the same format as the input JSON.
+        
+        Args:
+            vertices: A numpy array of shape (N, 3) containing reconstructed vertex coordinates.
+            output_path: Path to save the JSON file.
+        """
+        # Convert vertices to list format
+        vertices_list = vertices.tolist()
+        
+        # Calculate actual edge lengths from reconstructed vertices
+        actual_edge_lengths = []
+        for u, v in self.edges:
+            dist = np.linalg.norm(vertices[u] - vertices[v])
+            actual_edge_lengths.append(float(dist))
+
+        # Calculate opposing distances
+        opposing_distances = self.calculate_opposing_distances(vertices)
+        
+        # Prepare output data
+        output_data = {
+            "vertices": vertices_list,
+            "edges": self.edges,
+            "faces": self.faces,
+            "measured_edge_lengths": actual_edge_lengths,
+            "anchor_face": self.anchor_indices,
+            "opposing_face_distances": opposing_distances
+        }
+        
+        # Save to JSON file
+        with open(output_path, 'w') as f:
+            json.dump(output_data, f, indent=2)
+        
+        print(f"Reconstructed shape saved to {output_path}")
+
+    def save_reconstructed_obj(self, vertices, output_path):
+        """Save the reconstructed shape as an OBJ file.
+        
+        Args:
+            vertices: A numpy array of shape (N, 3) containing reconstructed vertex coordinates.
+            output_path: Path to save the OBJ file.
+        """
+        # Triangulate polygon faces (OBJ supports polygons, but trimesh requires triangles)
+        tri_faces = []
+        for face in self.faces:
+            if len(face) < 3:
+                continue
+            if len(face) == 3:
+                tri_faces.append(face)
+                continue
+            v0 = face[0]
+            for i in range(1, len(face) - 1):
+                tri_faces.append([v0, face[i], face[i + 1]])
+
+        mesh = trimesh.Trimesh(vertices=vertices, faces=tri_faces, process=False)
+        mesh.export(output_path)
+        print(f"Reconstructed OBJ saved to {output_path}")
+
 
 if __name__ == "__main__":
     # Generate data if not exists (though we already did)
@@ -352,6 +474,18 @@ if __name__ == "__main__":
     final_verts, history, model_errors, trajectory = reconstruction.run_optimization()
     
     reconstruction.verify_results(final_verts)
+    
+    volume = reconstruction.calculate_volume(final_verts)
+    print(f"Reconstructed Volume: {volume:.2f}")
+    
+    # Save reconstructed shape data
+    input_filename = os.path.splitext(os.path.basename(INPUT_CONFIG["data_path"]))[0]
+    output_filename = f"{input_filename}_reconstructed.json"
+    reconstruction.save_reconstructed_data(final_verts, output_filename)
+    
+    # Save reconstructed OBJ mesh
+    obj_filename = f"{input_filename}_reconstructed.obj"
+    reconstruction.save_reconstructed_obj(final_verts, obj_filename)
     
     # Visualization
     # Pass None for model_errors if we don't have true vertices (or handle inside visualizer)

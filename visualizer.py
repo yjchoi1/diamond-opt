@@ -210,8 +210,13 @@ def plot_3d_animation(trajectory, true_vertices, faces, filename="3d_animation.h
         name="Current Vertices"
     ))
 
+    # Determine trace indices to update
+    # If true_vertices exists, we added 2 traces (0 and 1). So opt traces are 2 and 3.
+    # If not, opt traces are 0 and 1.
+    start_trace_idx = 2 if true_vertices is not None else 0
+
     # Frames
-    # We update traces 2 and 3.
+    # We update traces start_trace_idx and start_trace_idx + 1.
     frames = []
     step = max(1, len(trajectory) // 100) # 100 frames max
     for k, i in enumerate(range(0, len(trajectory), step)):
@@ -220,10 +225,10 @@ def plot_3d_animation(trajectory, true_vertices, faces, filename="3d_animation.h
         
         frames.append(go.Frame(
             data=[
-                go.Scatter3d(x=ex, y=ey, z=ez), # Matches Trace 2 (first in list effectively?)
-                go.Scatter3d(x=verts[:,0], y=verts[:,1], z=verts[:,2]) # Matches Trace 3
+                go.Scatter3d(x=ex, y=ey, z=ez), # Matches Opt Edges
+                go.Scatter3d(x=verts[:,0], y=verts[:,1], z=verts[:,2]) # Matches Opt Verts
             ],
-            traces=[2, 3], # Explicitly target traces 2 and 3
+            traces=[start_trace_idx, start_trace_idx + 1], # Explicitly target correct traces
             name=f"fr{k}"
         ))
         
